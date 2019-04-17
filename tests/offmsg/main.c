@@ -41,7 +41,7 @@ typedef enum RUNNING_MODE {
     RECEIVER_MODE
 } RUNNING_MODE;
 
-const char *_str[] = {
+const char *mode_str[] = {
     "unknown",
     "sender",
     "receiver"
@@ -188,19 +188,19 @@ int main(int argc, char *argv[])
     ElaCallbacks callbacks = {0};
     ElaCarrier *w = NULL;
     RUNNING_MODE mode = UNKNOWN_MODE;
+    TestConfig *config = NULL;
     const char *config_file = NULL;
     char address[ELA_MAX_ADDRESS_LEN + 1] = {0};
     char userid[ELA_MAX_ID_LEN + 1] = {0};
     char datadir[PATH_MAX] = {0};
     char logfile[PATH_MAX] = {0};
-    int log_level = 0;
+    int level;
     int rc = 0;
     int i = 0;
     int debug = 0;
     int generate_info = 0;
     int opt = 0;
     int idx = 0;
-    int level;
     struct option options[] = {
         { "sender",         no_argument,        NULL, 1 },
         { "receiver",       no_argument,        NULL, 2 },
@@ -277,22 +277,22 @@ int main(int argc, char *argv[])
         return -1;
      }
 
-    global_config = load_config(config_file);
+    config = load_config(config_file);
 
     memset(&opts, 0, sizeof(opts));
-    sprintf(logfile, "%s/%s.log", global_config->data_location, _str[mode]);
+    sprintf(logfile, "%s/%s.log", config->data_location, mode_str[mode]);
 
     if (mode == SENDER_MODE)
-        level = global_config->sender_log_level;
+        level = config->sender_log_level;
     else
-        level = global_config->receiver_log_level;
+        level = config->receiver_log_level;
 
     vlog_init(level, logfile, output_null);
 
-    opts.udp_enabled = global_config->udp_enabled;
-    sprintf(datadir, "%s/%s", global_config->data_location, _str[mode]);
+    opts.udp_enabled = config->udp_enabled;
+    sprintf(datadir, "%s/%s", config->data_location, mode_str[mode]);
     opts.persistent_location = datadir;
-    opts.dht_bootstraps_size = global_config->bootstraps_size;
+    opts.dht_bootstraps_size = config->bootstraps_size;
     opts.dht_bootstraps = (DhtBootstrapNode *)calloc(1, sizeof(DhtBootstrapNode) * opts.dht_bootstraps_size);
     if (!opts.dht_bootstraps) {
         output_error();
@@ -301,7 +301,7 @@ int main(int argc, char *argv[])
 
     for (i = 0 ; i < opts.dht_bootstraps_size; i++) {
         DhtBootstrapNode *b = &opts.dht_bootstraps[i];
-        DhtBootstrapNode *node = global_config->bootstraps[i];
+        DhtBootstrapNode *node = config->bootstraps[i];
 
         b->ipv4 = node->ipv4;
         b->ipv6 = node->ipv6;
@@ -309,7 +309,7 @@ int main(int argc, char *argv[])
         b->public_key = node->public_key;
     }
 
-    opts.hive_bootstraps_size = global_config->hive_bootstraps_size;
+    opts.hive_bootstraps_size = config->hive_bootstraps_size;
     opts.hive_bootstraps = (HiveBootstrapNode *)calloc(1, sizeof(HiveBootstrapNode) * opts.hive_bootstraps_size);
     if (!opts.hive_bootstraps) {
         output_error();
@@ -317,9 +317,9 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    for (i = 0 ; i < global_config->hive_bootstraps_size; i++) {
+    for (i = 0 ; i < config->hive_bootstraps_size; i++) {
         HiveBootstrapNode *b = &opts.hive_bootstraps[i];
-        HiveBootstrapNode *node = global_config->hive_bootstraps[i];
+        HiveBootstrapNode *node = config->hive_bootstraps[i];
 
         b->ipv4 = node->ipv4;
         b->ipv6 = node->ipv6;
@@ -365,7 +365,7 @@ quit:
     WSACleanup();
 #endif
 
-    deref(global_config);
+    deref(config);
 
     return rc;
 }

@@ -34,8 +34,6 @@
 
 #include "config.h"
 
-TestConfig *global_config;
-
 static int get_str(config_t *cfg, const char *name, const char *default_value,
                    char *value, size_t len)
 {
@@ -345,4 +343,3 @@ TestConfig *load_config(const char *config_file)
     config_destroy(&cfg);
     return config;
 }
-

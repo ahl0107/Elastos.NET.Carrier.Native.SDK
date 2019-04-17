@@ -42,8 +42,6 @@ typedef struct TestConfig {
     HiveBootstrapNode **hive_bootstraps;
 } TestConfig;
 
-extern TestConfig *global_config;
-
 TestConfig *load_config(const char *config_file);
 
 #endif /* __TEST_CONFIG_H__ */
