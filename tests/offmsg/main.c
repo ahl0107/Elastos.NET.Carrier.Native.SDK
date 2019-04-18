@@ -40,10 +40,17 @@ typedef enum RUNNING_MODE {
     RECEIVER_MODE
 } RUNNING_MODE;
 
+typedef enum ACTION {
+    UNKNOWN_ACTION,
+    INIT_ACTION,
+    FRIEND_ACTION
+} ACTION;
+
 typedef struct Bundle {
     char peer_address[ELA_MAX_ADDRESS_LEN + 1];
     char peer_id[ELA_MAX_ID_LEN + 1];
     bool connected;
+    ACTION action;
 } Bundle;
 
 const char *mode_str[] = {
@@ -80,15 +87,12 @@ static void output_error()
 static void idle_callback(ElaCarrier *w, void *context)
 {
     Bundle *b = (Bundle*)context;
-    static int first_time = 1;
 
-    if (b->connected && ela_is_ready(w) && (first_time == 1)) {
-        if (!ela_is_friend(w, b->peer_id)) {
-            if (strlen(b->peer_address) > 0) {
-                friend_add(w, context);
-                first_time = 0;
-            }
-        }
+    if ((b->action == FRIEND_ACTION) && b->connected && ela_is_ready(w)) {
+        if (!ela_is_friend(w, b->peer_id))
+            friend_add(w, context);
+
+        exit(0);
     }
 }
 
@@ -222,6 +226,7 @@ int main(int argc, char *argv[])
     ElaCarrier *w = NULL;
     Bundle bundle = {0};
     RUNNING_MODE mode = UNKNOWN_MODE;
+    ACTION action = UNKNOWN_ACTION;
     TestConfig *config = NULL;
     const char *config_file = NULL;
     char address[ELA_MAX_ADDRESS_LEN + 1] = {0};
@@ -232,7 +237,6 @@ int main(int argc, char *argv[])
     int rc = 0;
     int i = 0;
     int debug = 0;
-    int initonly = 0;
     int opt = 0;
     int idx = 0;
     struct option options[] = {
@@ -271,7 +275,7 @@ int main(int argc, char *argv[])
             break;
 
         case 4:
-            initonly = 1;
+            action = INIT_ACTION;
             break;
 
         case 'a':
@@ -300,7 +304,10 @@ int main(int argc, char *argv[])
     if (debug)
         wait_for_debugger_attach();
 
-    if (mode == UNKNOWN_MODE) {
+    if ((action == UNKNOWN_ACTION) && strlen(bundle.peer_address) > 0 && strlen(bundle.peer_id) > 0)
+        action = FRIEND_ACTION;
+
+    if (mode == UNKNOWN_MODE || action == UNKNOWN_ACTION) {
         output_error();
         return -1;
     }
@@ -380,6 +387,7 @@ int main(int argc, char *argv[])
     callbacks.friend_message = message_callback;
 
     bundle.connected = false;
+    bundle.action = action;
     w = ela_new(&opts, &callbacks, &bundle);
     free(opts.dht_bootstraps);
     free(opts.hive_bootstraps);
@@ -391,7 +399,7 @@ int main(int argc, char *argv[])
         goto quit;
     }
 
-    if (initonly) {
+    if (action == INIT_ACTION) {
         ela_get_address(w, address, sizeof(address));
         ela_get_userid(w, userid, sizeof(userid));
         output_addr_userid(address, userid);
