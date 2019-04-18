@@ -40,11 +40,30 @@ typedef enum RUNNING_MODE {
     RECEIVER_MODE
 } RUNNING_MODE;
 
+typedef struct Bundle {
+    char peer_address[ELA_MAX_ADDRESS_LEN + 1];
+    char peer_id[ELA_MAX_ID_LEN + 1];
+    bool connected;
+} Bundle;
+
 const char *mode_str[] = {
     "unknown",
     "sender",
     "receiver"
 };
+
+static void friend_add(ElaCarrier *w, void *context)
+{
+    Bundle *b = (Bundle*)context;
+    int rc;
+
+    rc = ela_add_friend(w, b->peer_address, "Hello");
+    if (rc == 0)
+        vlogI("Request to add a new friend successfully.\n");
+    else
+        vlogE("Request to add a new friend unsuccessfully(0x%x).\n",
+              ela_get_error());
+}
 
 static void output_null(const char *format, va_list args) {}
 
@@ -60,11 +79,26 @@ static void output_error()
 
 static void idle_callback(ElaCarrier *w, void *context)
 {
+    Bundle *b = (Bundle*)context;
+    static int first_time = 1;
+
+    if (b->connected && ela_is_ready(w) && (first_time == 1)) {
+        if (!ela_is_friend(w, b->peer_id)) {
+            if (strlen(b->peer_address) > 0) {
+                friend_add(w, context);
+                first_time = 0;
+            }
+        }
+    }
 }
 
 static void connection_callback(ElaCarrier *w, ElaConnectionStatus status,
                                 void *context)
 {
+    Bundle *b = (Bundle*)context;
+
+    b->connected = (status == ElaConnectionStatus_Connected) ? true : false;
+
     switch (status) {
     case ElaConnectionStatus_Connected:
         vlogI("Connected to carrier network.\n");
@@ -186,6 +220,7 @@ int main(int argc, char *argv[])
     ElaOptions opts = {0};
     ElaCallbacks callbacks = {0};
     ElaCarrier *w = NULL;
+    Bundle bundle = {0};
     RUNNING_MODE mode = UNKNOWN_MODE;
     TestConfig *config = NULL;
     const char *config_file = NULL;
@@ -205,6 +240,8 @@ int main(int argc, char *argv[])
         { "receiver",       no_argument,        NULL, 2 },
         { "debug",          no_argument,        NULL, 3 },
         { "init",           no_argument,        NULL, 4 },
+        { "remote-address", required_argument,  NULL, 'a' },
+        { "remote-userid",  required_argument,  NULL, 'u' },
         { "config",         required_argument,  NULL, 'c' },
         { "help",           no_argument,        NULL, 'h' },
         { NULL,             0,                  NULL, 0 }
@@ -217,7 +254,7 @@ int main(int argc, char *argv[])
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    while ((opt = getopt_long(argc, argv, "c:h?", options, &idx)) != -1) {
+    while ((opt = getopt_long(argc, argv, "a:u:c:h?", options, &idx)) != -1) {
         switch (opt) {
         case 1:
         case 2:
@@ -235,6 +272,18 @@ int main(int argc, char *argv[])
 
         case 4:
             initonly = 1;
+            break;
+
+        case 'a':
+            if (optarg)
+                strncpy(bundle.peer_address, optarg, ELA_MAX_ADDRESS_LEN);
+
+            break;
+
+        case 'u':
+            if (optarg)
+                strncpy(bundle.peer_id, optarg, ELA_MAX_ID_LEN);
+
             break;
 
         case 'c':
@@ -330,7 +379,8 @@ int main(int argc, char *argv[])
     callbacks.friend_connection = friend_connection_callback;
     callbacks.friend_message = message_callback;
 
-    w = ela_new(&opts, &callbacks, NULL);
+    bundle.connected = false;
+    w = ela_new(&opts, &callbacks, &bundle);
     free(opts.dht_bootstraps);
     free(opts.hive_bootstraps);
 

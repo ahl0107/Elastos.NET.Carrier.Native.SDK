@@ -202,7 +202,7 @@ TestConfig *load_config(const char *config_file)
     else
         config->udp_enabled = true;
 
-    get_str(&cfg, "datadir", "~/.offlinemsgtests", path, sizeof(path));
+    get_str(&cfg, "datadir", "~/.offmsg_tests", path, sizeof(path));
     qualified_path(path, config_file, config->data_location);
 
     config->sender_log_level = (int)get_int(&cfg, "sender.loglevel", 4);
