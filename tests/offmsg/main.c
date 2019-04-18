@@ -18,7 +18,6 @@
 #ifdef HAVE_SYS_RESOURCE_H
 #include <sys/resource.h>
 #endif
-
 #if defined(_WIN32) || defined(_WIN64)
 #include <io.h>
 #endif
@@ -49,14 +48,14 @@ const char *mode_str[] = {
 
 static void output_null(const char *format, va_list args) {}
 
-static void output_error()
-{
-    printf("error:error\n");
-}
-
 static void output_addr_userid(const char *addr, const char *userid)
 {
     printf("%s:%s\n", addr, userid);
+}
+
+static void output_error()
+{
+    output_addr_userid("error", "error");
 }
 
 static void idle_callback(ElaCarrier *w, void *context)
@@ -198,7 +197,7 @@ int main(int argc, char *argv[])
     int rc = 0;
     int i = 0;
     int debug = 0;
-    int generate_info = 0;
+    int initonly = 0;
     int opt = 0;
     int idx = 0;
     struct option options[] = {
@@ -235,7 +234,7 @@ int main(int argc, char *argv[])
             break;
 
         case 4:
-            generate_info = 1;
+            initonly = 1;
             break;
 
         case 'c':
@@ -270,7 +269,6 @@ int main(int argc, char *argv[])
 #endif
 
     config_file = get_config_path(config_file, config_files);
-
     if (!config_file || mode == UNKNOWN_MODE) {
         vlogE("Error: Missing config file");
         output_error();
@@ -343,7 +341,7 @@ int main(int argc, char *argv[])
         goto quit;
     }
 
-    if (generate_info) {
+    if (initonly) {
         ela_get_address(w, address, sizeof(address));
         ela_get_userid(w, userid, sizeof(userid));
         output_addr_userid(address, userid);
@@ -356,7 +354,6 @@ int main(int argc, char *argv[])
     if (rc != 0) {
         vlogE("Run carrier instance error: 0x%x\n", ela_get_error());
         ela_kill(w);
-        rc = -1;
         goto quit;
     }
 

@@ -28,10 +28,9 @@
 #include <ela_carrier.h>
 
 typedef struct TestConfig {
-    int shuffle;
-    int log2file;
     int sender_log_level;
     int receiver_log_level;
+
     char data_location[PATH_MAX];
     bool udp_enabled;
 

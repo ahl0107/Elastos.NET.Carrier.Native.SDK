@@ -197,14 +197,10 @@ TestConfig *load_config(const char *config_file)
     }
 
     rc = config_lookup_bool(&cfg, "udp_enabled", &intopt);
-    if (rc && !intopt) {
+    if (rc && !intopt)
         config->udp_enabled = false;
-    } else {
+    else
         config->udp_enabled = true;
-    }
-
-    config->shuffle = (int)get_int(&cfg, "shuffle", 1);
-    config->log2file = (int)get_int(&cfg, "log2file", 0);
 
     get_str(&cfg, "datadir", "~/.offlinemsgtests", path, sizeof(path));
     qualified_path(path, config_file, config->data_location);
