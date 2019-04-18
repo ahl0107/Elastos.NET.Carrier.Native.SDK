@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <time.h>
 
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
@@ -27,6 +28,7 @@
 
 #include "config.h"
 
+#define MSG_INACTIVE_TIMEOUT   30
 #define CONFIG_NAME   "offmsg_tests.conf"
 
 static const char *config_files[] = {
@@ -43,14 +45,20 @@ typedef enum RUNNING_MODE {
 typedef enum ACTION {
     UNKNOWN_ACTION,
     INIT_ACTION,
-    FRIEND_ACTION
+    FRIEND_ACTION,
+    SEND_MSG_ACTION,
+    RECV_MSG_ACTION
 } ACTION;
 
 typedef struct Bundle {
     char peer_address[ELA_MAX_ADDRESS_LEN + 1];
     char peer_id[ELA_MAX_ID_LEN + 1];
+    int fd;
+    time_t last_active_time;
     bool connected;
+    bool friend_connected;
     ACTION action;
+    RUNNING_MODE mode;
 } Bundle;
 
 const char *mode_str[] = {
@@ -66,9 +74,9 @@ static void friend_add(ElaCarrier *w, void *context)
 
     rc = ela_add_friend(w, b->peer_address, "Hello");
     if (rc == 0)
-        vlogI("Request to add a new friend successfully.\n");
+        vlogI("Request to add a new friend successfully.");
     else
-        vlogE("Request to add a new friend unsuccessfully(0x%x).\n",
+        vlogE("Request to add a new friend unsuccessfully(0x%x).",
               ela_get_error());
 }
 
@@ -84,6 +92,37 @@ static void output_error()
     output_addr_userid("error", "error");
 }
 
+static void send_msg_from_file(ElaCarrier *w, void *context)
+{
+    Bundle *b = (Bundle*)context;
+    char buf[1024] = {0};
+    int ret = 0;
+
+    ret = read(b->fd, buf, sizeof(buf));
+    if (ret > 0) {
+        ret = ela_send_friend_message(w, b->peer_id, buf, ret);
+        if (ret == 0)
+            vlogI("Send a message successfully.");
+        else
+            vlogE("Send a message unsucessfully.");
+    } else {
+        close(b->fd);
+        ela_kill(w);
+    }
+}
+
+static void save_msg_to_file(ElaCarrier *w, const void *msg, size_t len, void *context)
+{
+    Bundle *b = (Bundle*)context;
+    int ret = 0;
+
+    ret = write(b->fd, msg, len);
+    if (ret < 0) {
+        close(b->fd);
+        ela_kill(w);
+    }
+}
+
 static void idle_callback(ElaCarrier *w, void *context)
 {
     Bundle *b = (Bundle*)context;
@@ -92,7 +131,18 @@ static void idle_callback(ElaCarrier *w, void *context)
         if (!ela_is_friend(w, b->peer_id))
             friend_add(w, context);
 
-        exit(0);
+        ela_kill(w);
+    } else {
+        if ((b->action == SEND_MSG_ACTION) && b->connected && !b->friend_connected && ela_is_ready(w))
+            send_msg_from_file(w, context);
+        else if (b->action == RECV_MSG_ACTION) {
+            if (time(NULL) - b->last_active_time >= MSG_INACTIVE_TIMEOUT) {
+                close(b->fd);
+                ela_kill(w);
+            }
+        } else {
+            // Do nothing.
+        }
     }
 }
 
@@ -105,39 +155,58 @@ static void connection_callback(ElaCarrier *w, ElaConnectionStatus status,
 
     switch (status) {
     case ElaConnectionStatus_Connected:
-        vlogI("Connected to carrier network.\n");
+        vlogI("Connected to carrier network.");
         break;
 
     case ElaConnectionStatus_Disconnected:
-        vlogI("Disconnected from carrier network.\n");
+        vlogI("Disconnected from carrier network.");
         break;
 
     default:
-        vlogE("Error!!! Got unknown connection status %d.\n", status);
+        vlogE("Error!!! Got unknown connection status %d.", status);
     }
 }
 
 static void friend_connection_callback(ElaCarrier *w, const char *friendid,
                                        ElaConnectionStatus status, void *context)
 {
+    Bundle *b = (Bundle*)context;
+
+    b->friend_connected = (status == ElaConnectionStatus_Connected) ? true : false;
+
     switch (status) {
     case ElaConnectionStatus_Connected:
-        vlogI("Friend[%s] connection changed to be online\n", friendid);
+        vlogI("Friend[%s] connection changed to be online.", friendid);
         break;
 
     case ElaConnectionStatus_Disconnected:
-        vlogI("Friend[%s] connection changed to be offline.\n", friendid);
+        vlogI("Friend[%s] connection changed to be offline.", friendid);
         break;
 
     default:
-        vlogE("Error!!! Got unknown connection status %d.\n", status);
+        vlogE("Error!!! Got unknown connection status %d.", status);
     }
 }
 
 static void message_callback(ElaCarrier *w, const char *from,
                              const void *msg, size_t len, void *context)
 {
-    vlogI("Message from friend[%s]: %.*s\n", from, (int)len, msg);
+    Bundle *b = (Bundle*)context;
+
+    vlogI("Message from friend[%s]: %.*s", from, (int)len, msg);
+
+    if ((b->action == RECV_MSG_ACTION) && strcmp(from, b->peer_id) == 0 && len > 0) {
+        save_msg_to_file(w, msg, len, context);
+        b->last_active_time = time(NULL);
+    }
+}
+
+static void ready_callback(ElaCarrier *w, void *context)
+{
+    Bundle *b = (Bundle*)context;
+
+    if (b->action == RECV_MSG_ACTION)
+        b->last_active_time = time(NULL);
 }
 
 static void usage(void)
@@ -229,10 +298,13 @@ int main(int argc, char *argv[])
     ACTION action = UNKNOWN_ACTION;
     TestConfig *config = NULL;
     const char *config_file = NULL;
+    const char *msg_file = NULL;
     char address[ELA_MAX_ADDRESS_LEN + 1] = {0};
     char userid[ELA_MAX_ID_LEN + 1] = {0};
     char datadir[PATH_MAX] = {0};
     char logfile[PATH_MAX] = {0};
+    char msg_input[PATH_MAX] = {0};
+    char msg_output[PATH_MAX] = {0};
     int level;
     int rc = 0;
     int i = 0;
@@ -246,6 +318,8 @@ int main(int argc, char *argv[])
         { "init",           no_argument,        NULL, 4 },
         { "remote-address", required_argument,  NULL, 'a' },
         { "remote-userid",  required_argument,  NULL, 'u' },
+        { "refmsg-from",    required_argument,  NULL, 'f' },
+        { "refmsg-to",      required_argument,  NULL, 't' },
         { "config",         required_argument,  NULL, 'c' },
         { "help",           no_argument,        NULL, 'h' },
         { NULL,             0,                  NULL, 0 }
@@ -290,6 +364,28 @@ int main(int argc, char *argv[])
 
             break;
 
+        case 'f':
+            if (strlen(msg_input) > 0) {
+                usage();
+                return -1;
+            }
+
+            if (optarg)
+                strncpy(msg_input, optarg, sizeof(msg_input) - 1);
+
+            break;
+
+        case 't':
+            if (strlen(msg_output) > 0) {
+                usage();
+                return -1;
+            }
+
+            if (optarg)
+                strncpy(msg_output, optarg, sizeof(msg_output) - 1);
+
+            break;
+
         case 'c':
             config_file = optarg;
             break;
@@ -304,8 +400,17 @@ int main(int argc, char *argv[])
     if (debug)
         wait_for_debugger_attach();
 
-    if ((action == UNKNOWN_ACTION) && strlen(bundle.peer_address) > 0 && strlen(bundle.peer_id) > 0)
-        action = FRIEND_ACTION;
+    if ((action == UNKNOWN_ACTION && (mode == SENDER_MODE || mode == RECEIVER_MODE))
+        && strlen(bundle.peer_address) > 0 && strlen(bundle.peer_id) > 0) {
+        if (mode == SENDER_MODE && strlen(msg_input) > 0)
+            action = SEND_MSG_ACTION;
+        else if (mode == RECEIVER_MODE && strlen(msg_output) > 0)
+            action = RECV_MSG_ACTION;
+        else if ((mode == SENDER_MODE && strlen(msg_output) > 0)
+                || (mode == RECEIVER_MODE && strlen(msg_input) > 0));
+        else
+            action = FRIEND_ACTION;
+    }
 
     if (mode == UNKNOWN_MODE || action == UNKNOWN_ACTION) {
         output_error();
@@ -385,15 +490,18 @@ int main(int argc, char *argv[])
     callbacks.connection_status = connection_callback;
     callbacks.friend_connection = friend_connection_callback;
     callbacks.friend_message = message_callback;
+    callbacks.ready = ready_callback;
 
     bundle.connected = false;
+    bundle.friend_connected = false;
     bundle.action = action;
+    bundle.mode = mode;
     w = ela_new(&opts, &callbacks, &bundle);
     free(opts.dht_bootstraps);
     free(opts.hive_bootstraps);
 
     if (!w) {
-        vlogE("Create carrier instance error: 0x%x\n", ela_get_error());
+        vlogE("Create carrier instance error: 0x%x", ela_get_error());
         output_error();
         rc = -1;
         goto quit;
@@ -408,9 +516,26 @@ int main(int argc, char *argv[])
         goto quit;
     }
 
+    if (action == SEND_MSG_ACTION)
+        msg_file = msg_input;
+    if (action == RECV_MSG_ACTION)
+        msg_file = msg_output;
+
+    if (msg_file) {
+        bundle.fd = open(msg_file, O_RDONLY);
+        if (bundle.fd < 0) {
+            ela_kill(w);
+            rc = -1;
+            goto quit;
+        }
+    }
+
     rc = ela_run(w, 10);
     if (rc != 0) {
-        vlogE("Run carrier instance error: 0x%x\n", ela_get_error());
+        vlogE("Run carrier instance error: 0x%x", ela_get_error());
+        if (bundle.fd > 0)
+            close(bundle.fd);
+
         ela_kill(w);
         goto quit;
     }
