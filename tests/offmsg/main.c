@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -36,30 +37,34 @@ static const char *config_files[] = {
     NULL
 };
 
-typedef enum RUNNING_MODE {
-    UNKNOWN_MODE,
-    SENDER_MODE,
-    RECEIVER_MODE
-} RUNNING_MODE;
+enum  {
+    RunMode_unkown = 0,
+    RunMode_sender = 1,
+    RunMode_receiver = 2
+};
 
-typedef enum ACTION {
-    UNKNOWN_ACTION,
-    INIT_ACTION,
-    FRIEND_ACTION,
-    SEND_MSG_ACTION,
-    RECV_MSG_ACTION
-} ACTION;
+enum {
+    Task_unkown = 0,
+    Task_init = 4,
+    Task_addfriend = 5,
+    Task_offmsg = 6
+};
 
-typedef struct Bundle {
-    char peer_address[ELA_MAX_ADDRESS_LEN + 1];
-    char peer_id[ELA_MAX_ID_LEN + 1];
-    int fd;
-    time_t last_active_time;
+typedef struct TestCtx {
+    char remote_addr[ELA_MAX_ADDRESS_LEN + 1];
+    char remote_userid[ELA_MAX_ID_LEN + 1];
+    FILE *fp;
+
+    struct timeval last_timestamp;
+    int mode;
+    int tasktype;
+
     bool connected;
-    bool friend_connected;
-    ACTION action;
-    RUNNING_MODE mode;
-} Bundle;
+
+    int error;
+} TestCtx;
+
+static TestCtx testctx;
 
 const char *mode_str[] = {
     "unknown",
@@ -67,21 +72,7 @@ const char *mode_str[] = {
     "receiver"
 };
 
-static void friend_add(ElaCarrier *w, void *context)
-{
-    Bundle *b = (Bundle*)context;
-    int rc;
-
-    rc = ela_add_friend(w, b->peer_address, "Hello");
-    if (rc == 0)
-        vlogI("Request to add a new friend successfully.");
-    else
-        vlogE("Request to add a new friend unsuccessfully(0x%x).",
-              ela_get_error());
-}
-
 static void output_null(const char *format, va_list args) {}
-
 static void output_addr_userid(const char *addr, const char *userid)
 {
     printf("%s:%s\n", addr, userid);
@@ -92,84 +83,76 @@ static void output_error()
     output_addr_userid("error", "error");
 }
 
-static void send_msg_from_file(ElaCarrier *w, void *context)
+static void try_send_offmsg(ElaCarrier *w, TestCtx *ctx)
 {
-    Bundle *b = (Bundle*)context;
-    char buf[1024] = {0};
-    int ret = 0;
+    char *buf  = NULL;
+    size_t length = 0;
+    ssize_t rc;
 
-    ret = read(b->fd, buf, sizeof(buf));
-    if (ret > 0) {
-        ret = ela_send_friend_message(w, b->peer_id, buf, ret);
-        if (ret == 0)
-            vlogI("Send a message successfully.");
-        else
-            vlogE("Send a message unsucessfully.");
-    } else {
-        close(b->fd);
-        ela_kill(w);
+    rc = getline(&buf, &length, ctx->fp);
+    if (rc < 0) {
+        vlogE("Error: read offline message error.");
+        ctx->error = 1;
+        return;
     }
+
+    rc = ela_send_friend_message(w, ctx->remote_userid, buf, rc);
+    free(buf);
+
+    if (rc < 0) {
+        vlogE("Error: Send offline message error: 0x%x", ela_get_error());
+        ctx->error = 1;
+        return;
+    }
+
+    gettimeofday(&ctx->last_timestamp, NULL);
 }
 
-static void save_msg_to_file(ElaCarrier *w, const void *msg, size_t len, void *context)
+static void try_store_offmsg(ElaCarrier *w, TestCtx *ctx,
+                             const void *msg, size_t length)
 {
-    Bundle *b = (Bundle*)context;
-    int ret = 0;
-
-    ret = write(b->fd, msg, len);
-    if (ret < 0) {
-        close(b->fd);
-        ela_kill(w);
-    }
+    //TODO;
 }
 
 static void idle_callback(ElaCarrier *w, void *context)
 {
-    Bundle *b = (Bundle*)context;
+    TestCtx *ctx = (TestCtx *)context;
 
-    if ((b->action == FRIEND_ACTION) && b->connected && ela_is_ready(w)) {
-        if (!ela_is_friend(w, b->peer_id))
-            friend_add(w, context);
+    switch(ctx->tasktype) {
+    case Task_addfriend:
+        if (ctx->connected && !ela_is_friend(w, ctx->remote_userid)) {
+            int rc;
 
-        ela_kill(w);
-    } else {
-        if ((b->action == SEND_MSG_ACTION) && b->connected && !b->friend_connected && ela_is_ready(w))
-            send_msg_from_file(w, context);
-        else if (b->action == RECV_MSG_ACTION) {
-            if (time(NULL) - b->last_active_time >= MSG_INACTIVE_TIMEOUT) {
-                close(b->fd);
-                ela_kill(w);
-            }
-        } else {
-            // Do nothing.
+            rc = ela_add_friend(w, ctx->remote_userid, "offmsg_tests");
+            if (rc < 0)
+                vlogE("Error: Add friend error: 0x%x", ela_get_error());
         }
+        break;
+
+    case Task_offmsg:
+        if (ctx->mode == RunMode_sender) {
+            if (ctx->connected)
+                try_send_offmsg(w, ctx);
+        }
+        break;
+
+    default:
+        break;
     }
 }
 
 static void connection_callback(ElaCarrier *w, ElaConnectionStatus status,
                                 void *context)
 {
-    Bundle *b = (Bundle*)context;
+    TestCtx *ctx = (TestCtx *)context;
 
-    b->connected = (status == ElaConnectionStatus_Connected) ? true : false;
-
-    switch (status) {
-    case ElaConnectionStatus_Connected:
-        vlogI("Connected to carrier network.");
-        break;
-
-    case ElaConnectionStatus_Disconnected:
-        vlogI("Disconnected from carrier network.");
-        break;
-
-    default:
-        vlogE("Error!!! Got unknown connection status %d.", status);
-    }
+    ctx->connected = (status == ElaConnectionStatus_Connected);
 }
 
 static void friend_connection_callback(ElaCarrier *w, const char *friendid,
                                        ElaConnectionStatus status, void *context)
 {
+    /*
     Bundle *b = (Bundle*)context;
 
     b->friend_connected = (status == ElaConnectionStatus_Connected) ? true : false;
@@ -185,28 +168,26 @@ static void friend_connection_callback(ElaCarrier *w, const char *friendid,
 
     default:
         vlogE("Error!!! Got unknown connection status %d.", status);
-    }
+    }*/
 }
 
 static void message_callback(ElaCarrier *w, const char *from,
                              const void *msg, size_t len, void *context)
 {
-    Bundle *b = (Bundle*)context;
+    TestCtx *ctx = (TestCtx *)context;
 
     vlogI("Message from friend[%s]: %.*s", from, (int)len, msg);
 
-    if ((b->action == RECV_MSG_ACTION) && strcmp(from, b->peer_id) == 0 && len > 0) {
-        save_msg_to_file(w, msg, len, context);
-        b->last_active_time = time(NULL);
+    if (ctx->tasktype == Task_offmsg && ctx->mode == RunMode_receiver) {
+        try_store_offmsg(w, ctx, msg, len);
+        gettimeofday(&ctx->last_timestamp, NULL);
     }
 }
 
 static void ready_callback(ElaCarrier *w, void *context)
 {
-    Bundle *b = (Bundle*)context;
-
-    if (b->action == RECV_MSG_ACTION)
-        b->last_active_time = time(NULL);
+    TestCtx *ctx = (TestCtx *)context;
+    gettimeofday(&ctx->last_timestamp, NULL);
 }
 
 static void usage(void)
@@ -214,9 +195,12 @@ static void usage(void)
     printf("usage: offmsg_tests [option] --sender | --receiver.\n"
            "\n"
            "    -c, --config[=<config-path>\n"
-           "                     test pathname of config file\n"
-           "    --init           create carrier instance, and print its \n"
+           "                     the pathname of test config file\n"
+           "    --init           try to create carrier instance, and print its\n"
            "                     address and userid\n"
+           "    --add-friend     try to add new friend.\n"
+           "    --message        try to send offline message (for sender) or\n"
+           "                     receive offline message (for receiver)\n"
            "\n"
            "    --sender         the role to send offline messages\n"
            "    --receiver       the role to receive offline messages\n"
@@ -226,13 +210,9 @@ static void usage(void)
            "    -u, --remote-userid=<remote-userid>\n"
            "                     the userid of remote tests node\n"
            "\n"
-           "    --refmsg-from=<offmsg-text>\n"
+           "    --refmsg=<offmsg-text>\n"
            "                     the text file that sender read from and send\n"
-           "                     it as offline message to remote tests node"
-           "    --refmsg-to=<offmsg-text>\n"
-           "                     the text file that receiver store offline\n"
-           "                     offline message into after receiving them\n"
-           "                     them from tests node\n"
+           "                     it as offline message to remote tests node\n"
            "\n");
 }
 
@@ -265,15 +245,15 @@ static void signal_handler(int signum)
     exit(-1);
 }
 
-const char *get_config_path(const char *config_file, const char *config_files[])
+const char *get_config_path(const char *cfg_file, const char *cfg_files[])
 {
-    const char **file = config_file ? &config_file : config_files;
+    const char **file = cfg_file ? &cfg_file : cfg_files;
 
     for (; *file; ) {
         int fd = open(*file, O_RDONLY);
         if (fd < 0) {
-            if (*file == config_file)
-                file = config_files;
+            if (*file == cfg_file)
+                file = cfg_files;
             else
                 file++;
 
@@ -293,37 +273,36 @@ int main(int argc, char *argv[])
     ElaOptions opts = {0};
     ElaCallbacks callbacks = {0};
     ElaCarrier *w = NULL;
-    Bundle bundle = {0};
-    RUNNING_MODE mode = UNKNOWN_MODE;
-    ACTION action = UNKNOWN_ACTION;
     TestConfig *config = NULL;
     const char *config_file = NULL;
-    const char *msg_file = NULL;
-    char address[ELA_MAX_ADDRESS_LEN + 1] = {0};
-    char userid[ELA_MAX_ID_LEN + 1] = {0};
-    char datadir[PATH_MAX] = {0};
     char logfile[PATH_MAX] = {0};
-    char msg_input[PATH_MAX] = {0};
-    char msg_output[PATH_MAX] = {0};
+    char datadir[PATH_MAX] = {0};
+    char *refmsg_path = NULL;
+    TestCtx *ctx = &testctx;
+    int tasktype = 0;
+    int mode = 0;
     int level;
-    int rc = 0;
+    int rc = -1;
     int i = 0;
     int debug = 0;
     int opt = 0;
     int idx = 0;
     struct option options[] = {
-        { "sender",         no_argument,        NULL, 1 },
-        { "receiver",       no_argument,        NULL, 2 },
-        { "debug",          no_argument,        NULL, 3 },
-        { "init",           no_argument,        NULL, 4 },
+        { "sender",         no_argument,        NULL,  1 },
+        { "receiver",       no_argument,        NULL,  2 },
+        { "debug",          no_argument,        NULL,  3 },
+        { "init",           no_argument,        NULL,  4 },
+        { "add-friend",     no_argument,        NULL,  5 },
+        { "messaging",      no_argument,        NULL,  6 },
         { "remote-address", required_argument,  NULL, 'a' },
         { "remote-userid",  required_argument,  NULL, 'u' },
-        { "refmsg-from",    required_argument,  NULL, 'f' },
-        { "refmsg-to",      required_argument,  NULL, 't' },
+        { "refmsg",         required_argument,  NULL, 'm' },
         { "config",         required_argument,  NULL, 'c' },
         { "help",           no_argument,        NULL, 'h' },
         { NULL,             0,                  NULL, 0 }
     };
+
+    memset(ctx, 0, sizeof(TestCtx));
 
 #ifdef HAVE_SYS_RESOURCE_H
     sys_coredump_set(true);
@@ -336,7 +315,7 @@ int main(int argc, char *argv[])
         switch (opt) {
         case 1:
         case 2:
-            if (mode != UNKNOWN_MODE) {
+            if (mode > 0) {
                 output_error();
                 return -1;
             }
@@ -349,41 +328,29 @@ int main(int argc, char *argv[])
             break;
 
         case 4:
-            action = INIT_ACTION;
+        case 5:
+        case 6:
+            if (tasktype > 0) {
+                output_error();
+                return -1;
+            }
+
+            tasktype = opt;
             break;
 
         case 'a':
             if (optarg)
-                strncpy(bundle.peer_address, optarg, ELA_MAX_ADDRESS_LEN);
-
+                strncpy(ctx->remote_addr, optarg, ELA_MAX_ADDRESS_LEN);
             break;
 
         case 'u':
             if (optarg)
-                strncpy(bundle.peer_id, optarg, ELA_MAX_ID_LEN);
-
+                strncpy(ctx->remote_userid, optarg, ELA_MAX_ID_LEN);
             break;
 
-        case 'f':
-            if (strlen(msg_input) > 0) {
-                usage();
-                return -1;
-            }
-
+        case 'm':
             if (optarg)
-                strncpy(msg_input, optarg, sizeof(msg_input) - 1);
-
-            break;
-
-        case 't':
-            if (strlen(msg_output) > 0) {
-                usage();
-                return -1;
-            }
-
-            if (optarg)
-                strncpy(msg_output, optarg, sizeof(msg_output) - 1);
-
+                refmsg_path = strdup(optarg);
             break;
 
         case 'c':
@@ -400,22 +367,18 @@ int main(int argc, char *argv[])
     if (debug)
         wait_for_debugger_attach();
 
-    if ((action == UNKNOWN_ACTION && (mode == SENDER_MODE || mode == RECEIVER_MODE))
-        && strlen(bundle.peer_address) > 0 && strlen(bundle.peer_id) > 0) {
-        if (mode == SENDER_MODE && strlen(msg_input) > 0)
-            action = SEND_MSG_ACTION;
-        else if (mode == RECEIVER_MODE && strlen(msg_output) > 0)
-            action = RECV_MSG_ACTION;
-        else if ((mode == SENDER_MODE && strlen(msg_output) > 0)
-                || (mode == RECEIVER_MODE && strlen(msg_input) > 0));
-        else
-            action = FRIEND_ACTION;
-    }
-
-    if (mode == UNKNOWN_MODE || action == UNKNOWN_ACTION) {
+    if (!mode || !tasktype) {
         output_error();
         return -1;
     }
+
+    if (tasktype == Task_offmsg && !refmsg_path) {
+        output_error();
+        return -1;
+    }
+
+    ctx->mode = mode;
+    ctx->tasktype = tasktype;
 
 #if defined(_WIN32) || defined(_WIN64)
     WORD wVersionRequested;
@@ -430,18 +393,23 @@ int main(int argc, char *argv[])
 #endif
 
     config_file = get_config_path(config_file, config_files);
-    if (!config_file || mode == UNKNOWN_MODE) {
+    if (!config_file || mode == RunMode_unkown) {
         vlogE("Error: Missing config file");
         output_error();
-        return -1;
+        goto error_exit;
      }
 
     config = load_config(config_file);
+    if (!config) {
+        vlogE("Error: Loading config file.");
+        output_error();
+        goto error_exit;
+    }
 
     memset(&opts, 0, sizeof(opts));
     sprintf(logfile, "%s/%s.log", config->data_location, mode_str[mode]);
 
-    if (mode == SENDER_MODE)
+    if (mode == RunMode_sender)
         level = config->sender_log_level;
     else
         level = config->receiver_log_level;
@@ -455,7 +423,7 @@ int main(int argc, char *argv[])
     opts.dht_bootstraps = (DhtBootstrapNode *)calloc(1, sizeof(DhtBootstrapNode) * opts.dht_bootstraps_size);
     if (!opts.dht_bootstraps) {
         output_error();
-        return -1;
+        goto error_exit;
     }
 
     for (i = 0 ; i < opts.dht_bootstraps_size; i++) {
@@ -473,7 +441,7 @@ int main(int argc, char *argv[])
     if (!opts.hive_bootstraps) {
         output_error();
         free(opts.dht_bootstraps);
-        return -1;
+        goto error_exit;
     }
 
     for (i = 0 ; i < config->hive_bootstraps_size; i++) {
@@ -492,60 +460,64 @@ int main(int argc, char *argv[])
     callbacks.friend_message = message_callback;
     callbacks.ready = ready_callback;
 
-    bundle.connected = false;
-    bundle.friend_connected = false;
-    bundle.action = action;
-    bundle.mode = mode;
-    w = ela_new(&opts, &callbacks, &bundle);
+    w = ela_new(&opts, &callbacks, ctx);
     free(opts.dht_bootstraps);
     free(opts.hive_bootstraps);
 
     if (!w) {
         vlogE("Create carrier instance error: 0x%x", ela_get_error());
         output_error();
-        rc = -1;
-        goto quit;
+        goto error_exit;
     }
 
-    if (action == INIT_ACTION) {
-        ela_get_address(w, address, sizeof(address));
+    if (tasktype == Task_init) {
+        char addr[ELA_MAX_ADDRESS_LEN + 1];
+        char userid[ELA_MAX_ID_LEN + 1];
+
+        ela_get_address(w, addr, sizeof(addr));
         ela_get_userid(w, userid, sizeof(userid));
-        output_addr_userid(address, userid);
-        ela_kill(w);
-        rc = 0;
-        goto quit;
+        output_addr_userid(addr, userid);
+        goto error_exit;
     }
 
-    if (action == SEND_MSG_ACTION)
-        msg_file = msg_input;
-    if (action == RECV_MSG_ACTION)
-        msg_file = msg_output;
+    if (tasktype == Task_offmsg) {
+        FILE *fp;
+        char *open_mode[] = {
+            NULL,
+            "r",
+            "w"
+        };
 
-    if (msg_file) {
-        bundle.fd = open(msg_file, O_RDONLY);
-        if (bundle.fd < 0) {
-            ela_kill(w);
-            rc = -1;
-            goto quit;
-        }
+        fp = fopen(refmsg_path, open_mode[mode]);
+        free(refmsg_path);
+
+        if (!fp)
+            goto error_exit;
+
+        ctx->fp = fp;
     }
 
     rc = ela_run(w, 10);
     if (rc != 0) {
         vlogE("Run carrier instance error: 0x%x", ela_get_error());
-        if (bundle.fd > 0)
-            close(bundle.fd);
-
-        ela_kill(w);
-        goto quit;
+        goto error_exit;
     }
 
-quit:
+    ctx->error = rc;
+
+error_exit:
 #if defined(_WIN32) || defined(_WIN64)
     WSACleanup();
 #endif
 
-    deref(config);
+    if (ctx->fp)
+        fclose(ctx->fp);
 
-    return rc;
+    if (w)
+        ela_kill(w);
+
+    if (config)
+        deref(config);
+
+    return ctx->error;
 }
