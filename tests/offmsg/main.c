@@ -9,7 +9,6 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <time.h>
 
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
@@ -53,18 +52,14 @@ enum {
 typedef struct TestCtx {
     char remote_addr[ELA_MAX_ADDRESS_LEN + 1];
     char remote_userid[ELA_MAX_ID_LEN + 1];
+    bool connected;
+    bool killed_carrier;
     FILE *fp;
-
-    struct timeval last_timestamp;
     int mode;
     int tasktype;
-
-    bool connected;
-
     int error;
+    struct timeval last_timestamp;
 } TestCtx;
-
-static TestCtx testctx;
 
 const char *mode_str[] = {
     "unknown",
@@ -85,54 +80,88 @@ static void output_error()
 
 static void try_send_offmsg(ElaCarrier *w, TestCtx *ctx)
 {
-    char *buf  = NULL;
-    size_t length = 0;
-    ssize_t rc;
+    char buf[1024] = {0};
+    int rc = 0;
 
-    rc = getline(&buf, &length, ctx->fp);
-    if (rc < 0) {
-        vlogE("Error: read offline message error.");
-        ctx->error = 1;
-        return;
+    rc = fread(buf, sizeof(buf), 1, ctx->fp);
+    if (rc != 1) {
+        if (feof(ctx->fp))
+            ctx->error = 0;
+        else {
+            vlogE("Error: read offline message error.");
+            ctx->error = 1;
+        }
+        goto send_exit;
     }
 
     rc = ela_send_friend_message(w, ctx->remote_userid, buf, rc);
-    free(buf);
-
     if (rc < 0) {
         vlogE("Error: Send offline message error: 0x%x", ela_get_error());
         ctx->error = 1;
-        return;
+        goto send_exit;
     }
 
-    gettimeofday(&ctx->last_timestamp, NULL);
+send_exit:
+    fclose(ctx->fp);
+    ela_kill(w);
+    ctx->killed_carrier = true;
 }
 
 static void try_store_offmsg(ElaCarrier *w, TestCtx *ctx,
                              const void *msg, size_t length)
 {
-    //TODO;
+    size_t rc = 0;
+
+    rc = fwrite(msg, length, 1, ctx->fp);
+    if (rc != length) {
+        fclose(ctx->fp);
+        ela_kill(w);
+        ctx->error = 1;
+        ctx->killed_carrier = true;
+    } else
+        gettimeofday(&ctx->last_timestamp, NULL);
 }
 
 static void idle_callback(ElaCarrier *w, void *context)
 {
     TestCtx *ctx = (TestCtx *)context;
 
-    switch(ctx->tasktype) {
-    case Task_addfriend:
-        if (ctx->connected && !ela_is_friend(w, ctx->remote_userid)) {
-            int rc;
+    if (!ctx->connected || !ela_is_ready(w))
+        return;
 
+    switch(ctx->tasktype) {
+    case Task_addfriend: {
+        int rc = 0;
+
+        if (!ela_is_friend(w, ctx->remote_userid)) {
             rc = ela_add_friend(w, ctx->remote_userid, "offmsg_tests");
             if (rc < 0)
                 vlogE("Error: Add friend error: 0x%x", ela_get_error());
         }
+        ela_kill(w);
+        ctx->error = (rc == 0 ? 0 : 1);
+        ctx->killed_carrier = true;
         break;
+    }
 
     case Task_offmsg:
-        if (ctx->mode == RunMode_sender) {
-            if (ctx->connected)
-                try_send_offmsg(w, ctx);
+        if (ctx->mode == RunMode_sender)
+            try_send_offmsg(w, ctx);
+        else {
+            struct timeval now = {0};
+            struct timeval timeout_interval = {0};
+            struct timeval expiration = {0};
+
+            gettimeofday(&now, NULL);
+            timeout_interval.tv_sec = MSG_INACTIVE_TIMEOUT;
+            timeout_interval.tv_usec = 0;
+            timeradd(&ctx->last_timestamp, &timeout_interval, &expiration);
+            if (timercmp(&now, &expiration, >)) {
+                fclose(ctx->fp);
+                ela_kill(w);
+                ctx->error = 1;
+                ctx->killed_carrier = true;
+            }
         }
         break;
 
@@ -149,28 +178,6 @@ static void connection_callback(ElaCarrier *w, ElaConnectionStatus status,
     ctx->connected = (status == ElaConnectionStatus_Connected);
 }
 
-static void friend_connection_callback(ElaCarrier *w, const char *friendid,
-                                       ElaConnectionStatus status, void *context)
-{
-    /*
-    Bundle *b = (Bundle*)context;
-
-    b->friend_connected = (status == ElaConnectionStatus_Connected) ? true : false;
-
-    switch (status) {
-    case ElaConnectionStatus_Connected:
-        vlogI("Friend[%s] connection changed to be online.", friendid);
-        break;
-
-    case ElaConnectionStatus_Disconnected:
-        vlogI("Friend[%s] connection changed to be offline.", friendid);
-        break;
-
-    default:
-        vlogE("Error!!! Got unknown connection status %d.", status);
-    }*/
-}
-
 static void message_callback(ElaCarrier *w, const char *from,
                              const void *msg, size_t len, void *context)
 {
@@ -178,10 +185,8 @@ static void message_callback(ElaCarrier *w, const char *from,
 
     vlogI("Message from friend[%s]: %.*s", from, (int)len, msg);
 
-    if (ctx->tasktype == Task_offmsg && ctx->mode == RunMode_receiver) {
+    if (ctx->tasktype == Task_offmsg && ctx->mode == RunMode_receiver)
         try_store_offmsg(w, ctx, msg, len);
-        gettimeofday(&ctx->last_timestamp, NULL);
-    }
 }
 
 static void ready_callback(ElaCarrier *w, void *context)
@@ -277,7 +282,8 @@ int main(int argc, char *argv[])
     const char *config_file = NULL;
     char logfile[PATH_MAX] = {0};
     char datadir[PATH_MAX] = {0};
-    char *refmsg_path = NULL;
+    char refmsg_path[PATH_MAX] = {0};
+    TestCtx testctx = {0};
     TestCtx *ctx = &testctx;
     int tasktype = 0;
     int mode = 0;
@@ -350,7 +356,7 @@ int main(int argc, char *argv[])
 
         case 'm':
             if (optarg)
-                refmsg_path = strdup(optarg);
+                strncpy(refmsg_path, optarg, PATH_MAX - 1);
             break;
 
         case 'c':
@@ -372,11 +378,15 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    if (tasktype == Task_offmsg && !refmsg_path) {
+    if ((tasktype == Task_init && (strlen(ctx->remote_addr) > 0 || strlen(ctx->remote_userid) > 0))
+        || (tasktype == Task_addfriend && (strlen(ctx->remote_addr) == 0 || strlen(ctx->remote_userid) == 0))
+        || (tasktype == Task_offmsg && (strlen(ctx->remote_addr) == 0 || strlen(ctx->remote_userid) == 0
+                                     || strlen(refmsg_path) == 0))) {
         output_error();
         return -1;
     }
 
+    ctx->killed_carrier = false;
     ctx->mode = mode;
     ctx->tasktype = tasktype;
 
@@ -456,7 +466,6 @@ int main(int argc, char *argv[])
     memset(&callbacks, 0, sizeof(callbacks));
     callbacks.idle = idle_callback;
     callbacks.connection_status = connection_callback;
-    callbacks.friend_connection = friend_connection_callback;
     callbacks.friend_message = message_callback;
     callbacks.ready = ready_callback;
 
@@ -484,12 +493,11 @@ int main(int argc, char *argv[])
         FILE *fp;
         char *open_mode[] = {
             NULL,
-            "r",
-            "w"
+            "rb",
+            "wb"
         };
 
         fp = fopen(refmsg_path, open_mode[mode]);
-        free(refmsg_path);
 
         if (!fp)
             goto error_exit;
@@ -513,7 +521,7 @@ error_exit:
     if (ctx->fp)
         fclose(ctx->fp);
 
-    if (w)
+    if (w && !ctx->killed_carrier)
         ela_kill(w);
 
     if (config)
