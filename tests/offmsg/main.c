@@ -53,8 +53,10 @@ typedef struct TestCtx {
     char remote_addr[ELA_MAX_ADDRESS_LEN + 1];
     char remote_userid[ELA_MAX_ID_LEN + 1];
     bool connected;
-    bool killed_carrier;
-    FILE *fp;
+    bool did_kill;
+
+    FILE *offmsg_fp;
+
     int mode;
     int tasktype;
     int error;
@@ -80,31 +82,31 @@ static void output_error()
 
 static void try_send_offmsg(ElaCarrier *w, TestCtx *ctx)
 {
-    char buf[1024] = {0};
+    char buf[128] = {0};
+    int error =  0;
     int rc = 0;
 
-    rc = fread(buf, sizeof(buf), 1, ctx->fp);
+    rc = fread(buf, sizeof(buf), 1, ctx->offmsg_fp);
     if (rc != 1) {
-        if (feof(ctx->fp))
-            ctx->error = 0;
-        else {
-            vlogE("Error: read offline message error.");
-            ctx->error = 1;
+        if  (!feof(ctx->offmsg_fp)) {
+            vlogE("Error: read offmsg error: (%s)", ferror(ctx->offmsg_fp));
+            error = 1;
         }
-        goto send_exit;
+        goto error_exit;
     }
 
     rc = ela_send_friend_message(w, ctx->remote_userid, buf, rc);
     if (rc < 0) {
         vlogE("Error: Send offline message error: 0x%x", ela_get_error());
-        ctx->error = 1;
-        goto send_exit;
+        goto error_exit;
     }
 
-send_exit:
-    fclose(ctx->fp);
+    return;
+
+error_exit:
+    ctx->error = error;
+    ctx->did_kill = true;
     ela_kill(w);
-    ctx->killed_carrier = true;
 }
 
 static void try_store_offmsg(ElaCarrier *w, TestCtx *ctx,
@@ -112,14 +114,15 @@ static void try_store_offmsg(ElaCarrier *w, TestCtx *ctx,
 {
     size_t rc = 0;
 
-    rc = fwrite(msg, length, 1, ctx->fp);
-    if (rc != length) {
-        fclose(ctx->fp);
-        ela_kill(w);
+    rc = fwrite(msg, length, 1, ctx->offmsg_fp);
+    if (rc != 1) {
+        vlogE("Error: write offmsg error (%s)", ferror(ctx->offmsg_fp));
         ctx->error = 1;
-        ctx->killed_carrier = true;
-    } else
+        ctx->did_kill = true;
+        ela_kill(w);
+    } else {
         gettimeofday(&ctx->last_timestamp, NULL);
+    }
 }
 
 static void idle_callback(ElaCarrier *w, void *context)
@@ -138,9 +141,10 @@ static void idle_callback(ElaCarrier *w, void *context)
             if (rc < 0)
                 vlogE("Error: Add friend error: 0x%x", ela_get_error());
         }
-        ela_kill(w);
+
         ctx->error = (rc == 0 ? 0 : 1);
-        ctx->killed_carrier = true;
+        ctx->did_kill = true;
+        ela_kill(w);
         break;
     }
 
@@ -157,10 +161,9 @@ static void idle_callback(ElaCarrier *w, void *context)
             timeout_interval.tv_usec = 0;
             timeradd(&ctx->last_timestamp, &timeout_interval, &expiration);
             if (timercmp(&now, &expiration, >)) {
-                fclose(ctx->fp);
-                ela_kill(w);
                 ctx->error = 1;
-                ctx->killed_carrier = true;
+                ctx->did_kill = true;
+                ela_kill(w);
             }
         }
         break;
@@ -174,7 +177,6 @@ static void connection_callback(ElaCarrier *w, ElaConnectionStatus status,
                                 void *context)
 {
     TestCtx *ctx = (TestCtx *)context;
-
     ctx->connected = (status == ElaConnectionStatus_Connected);
 }
 
@@ -378,15 +380,17 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    if ((tasktype == Task_init && (strlen(ctx->remote_addr) > 0 || strlen(ctx->remote_userid) > 0))
-        || (tasktype == Task_addfriend && (strlen(ctx->remote_addr) == 0 || strlen(ctx->remote_userid) == 0))
-        || (tasktype == Task_offmsg && (strlen(ctx->remote_addr) == 0 || strlen(ctx->remote_userid) == 0
-                                     || strlen(refmsg_path) == 0))) {
+    if (tasktype == Task_addfriend && (!*ctx->remote_addr || !*ctx->remote_userid)) {
         output_error();
         return -1;
     }
 
-    ctx->killed_carrier = false;
+    if (tasktype == Task_offmsg && !*ctx->remote_userid) {
+        output_error();
+        return -1;
+    }
+
+    ctx->did_kill = false;
     ctx->mode = mode;
     ctx->tasktype = tasktype;
 
@@ -430,7 +434,8 @@ int main(int argc, char *argv[])
     sprintf(datadir, "%s/%s", config->data_location, mode_str[mode]);
     opts.persistent_location = datadir;
     opts.dht_bootstraps_size = config->bootstraps_size;
-    opts.dht_bootstraps = (DhtBootstrapNode *)calloc(1, sizeof(DhtBootstrapNode) * opts.dht_bootstraps_size);
+    opts.dht_bootstraps = (DhtBootstrapNode *)calloc(1,
+                    sizeof(DhtBootstrapNode) * opts.dht_bootstraps_size);
     if (!opts.dht_bootstraps) {
         output_error();
         goto error_exit;
@@ -447,7 +452,8 @@ int main(int argc, char *argv[])
     }
 
     opts.hive_bootstraps_size = config->hive_bootstraps_size;
-    opts.hive_bootstraps = (HiveBootstrapNode *)calloc(1, sizeof(HiveBootstrapNode) * opts.hive_bootstraps_size);
+    opts.hive_bootstraps = (HiveBootstrapNode *)calloc(1,
+                     sizeof(HiveBootstrapNode) * opts.hive_bootstraps_size);
     if (!opts.hive_bootstraps) {
         output_error();
         free(opts.dht_bootstraps);
@@ -502,7 +508,7 @@ int main(int argc, char *argv[])
         if (!fp)
             goto error_exit;
 
-        ctx->fp = fp;
+        ctx->offmsg_fp = fp;
     }
 
     rc = ela_run(w, 10);
@@ -516,10 +522,10 @@ error_exit:
     WSACleanup();
 #endif
 
-    if (ctx->fp)
-        fclose(ctx->fp);
+    if (ctx->offmsg_fp)
+        fclose(ctx->offmsg_fp);
 
-    if (w && !ctx->killed_carrier)
+    if (w && !ctx->did_kill)
         ela_kill(w);
 
     if (config)
