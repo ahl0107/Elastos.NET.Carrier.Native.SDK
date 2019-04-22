@@ -299,7 +299,7 @@ int main(int argc, char *argv[])
         { "debug",          no_argument,        NULL,  3 },
         { "init",           no_argument,        NULL,  4 },
         { "add-friend",     no_argument,        NULL,  5 },
-        { "messaging",      no_argument,        NULL,  6 },
+        { "message",        no_argument,        NULL,  6 },
         { "remote-address", required_argument,  NULL, 'a' },
         { "remote-userid",  required_argument,  NULL, 'u' },
         { "refmsg",         required_argument,  NULL, 'm' },
@@ -508,10 +508,8 @@ int main(int argc, char *argv[])
     rc = ela_run(w, 10);
     if (rc != 0) {
         vlogE("Run carrier instance error: 0x%x", ela_get_error());
-        goto error_exit;
+        ctx->error = rc;
     }
-
-    ctx->error = rc;
 
 error_exit:
 #if defined(_WIN32) || defined(_WIN64)
